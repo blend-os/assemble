@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import click
+import psutil
+import subprocess
+import configparser
+import xml.etree.ElementTree as ET
+
+from multiprocessing import Pool
+from urllib.parse import urlparse
+
+
+@click.group("cli")
+def cli():
+    """Assemble is a tool for managing blendOS builds and code,
+similar to 'repo' for Android and other projects maintained
+by Google."""
+
+
+def git_clone(url: str, branch: str, depth: int, path: str):
+    git_cmd = ['git', 'clone', url, path]
+    if branch != None:
+        git_cmd += ['-b', branch]
+    if depth != 0:
+        git_cmd += ['--depth', 1]
+    try:
+        os.environ['DEBUG_ASSEMBLE']
+        print(f'DEBUG: Cloning repo {url} to {path}.')
+        return subprocess.run(git_cmd, stdout=sys.stdout, stderr=sys.stderr).returncode
+    except KeyError:
+        return subprocess.run(git_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+def git_head(path: str):
+    print(f'Reverting back to HEAD in repo at {path}.')
+    subprocess.run(['git', 'clean', '-df'], stdout=sys.stdout, stderr=sys.stderr, cwd=path)
+    return subprocess.run(['git', 'reset', '--hard', 'HEAD'], stdout=sys.stdout, stderr=sys.stderr, cwd=path).returncode
+
+
+def git_pull(path: str):
+    print(f'Updating repo at {path}.')
+    return subprocess.run(['git', 'pull'], stdout=sys.stdout, stderr=sys.stderr, cwd=path).returncode
+
+
+def parse_manifest(path: str, parallel_count: int, depth: int):
+    try:
+        os.environ['DEBUG_ASSEMBLE']
+        print(f'DEBUG: Interpreting manifest file at {path}.')
+    except:
+        pass
+
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    remotes = {
+        'github': {
+            'fetch': 'https://github.com/{}'
+        }
+    }
+
+    default_remote = 'github'
+
+    git_repos = []
+
+    for child in root.iter():
+        if child.tag == 'remote':
+            remotes[child.attrib['name']] = {'fetch': child.attrib['fetch']}
+        elif child.tag == 'default':
+            if child.attrib['remote'] in remotes.keys():
+                default_remote = child.attrib['remote']
+        elif child.tag == 'project':
+            subprocess.call(
+                ['mkdir', '-p', os.path.dirname(child.attrib['path'])])
+            if 'remote' in child.attrib.keys():
+                _fetch = remotes[child.attrib['remote']]['fetch'].replace(
+                            '{}', child.attrib['name'])
+            else:
+                _fetch = remotes[default_remote]['fetch'].replace(
+                            '{}', child.attrib['name'])
+            git_repos.append({
+                'name': child.attrib['name'],
+                'fetch': _fetch,
+                'branch': None,
+                'depth': depth,
+                'path': child.attrib['path']
+            })
+
+    with Pool(parallel_count) as p:
+        try:
+            commits = p.map(process_repo, git_repos)
+        except Exception as e:
+            print(e)
+            exit(1)
+
+    with open('.assemble/latest_commits', 'w') as latest_commits:
+        config = configparser.ConfigParser()
+        commits_dict = {}
+        for name, commit in commits:
+            commits_dict[name] = commit
+        config['commits'] = commits_dict
+        config.write(latest_commits)
+        print()
+
+
+def process_repo(repo):
+    if os.path.isdir(repo['path']):
+        if git_head(repo['path']):
+            raise Exception(
+                f'Failed to revert back to HEAD in {repo["name"]}.')
+        if git_pull(repo['path']):
+            raise Exception(f'Failed to update repository {repo["name"]}.')
+    elif git_clone(repo['fetch'], None, repo['depth'], repo['path']):
+        raise Exception(f'Failed to clone repository {repo["name"]}.')
+    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=repo['path'],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode().strip()
+    if commit != '':
+        return (repo['path'], commit)
+    else:
+        raise Exception(
+            f'Failed to receive commit ID for repository {repo["name"]}.')
+
+
+@cli.command("init")
+@click.argument('manifest_url', metavar='<manifest URL>')
+@click.argument('manifest_branch', metavar='<manifest branch>')
+def init(manifest_url: str, manifest_branch: str):
+    """Initialize a repository."""
+
+    # Perform a few checks.
+    if not (manifest_url.startswith('file://') or manifest_url.startswith('http://') or manifest_url.startswith('https://')):
+        if not os.path.isdir(f'{manifest_url}/.git'):
+            manifest_url = f'http://{manifest_url}'
+
+    # Mkdir .assemble
+    if os.path.isdir('.assemble'):
+        print("This repository has already been initialized, are you sure you didn't mean to run 'assemble sync'?")
+        print("If not, it's suggested to remove this directory and recreate it.")
+        exit(1)
+    os.mkdir('.assemble')
+
+    with open('.assemble/config.ini', 'w') as assemble_config:
+        config = configparser.ConfigParser()
+        config['manifest'] = {
+            'url': manifest_url,
+            'branch': manifest_branch
+        }
+        config.write(assemble_config)
+
+
+@cli.command("sync")
+@click.option('-j', '--parallel-count', default=psutil.cpu_count(), help='Number of parallel git processes to run.')
+@click.option('--depth', default=0, help='Depth to clone each Git repository with.')
+def sync(parallel_count: int, depth: int):
+    """Sync all the pieces of a repository."""
+
+    if not os.path.isfile('.assemble/config.ini'):
+        print("You must initialize a repository in the current directory before running this command.")
+        exit(1)
+
+    config = configparser.ConfigParser()
+    config.read('.assemble/config.ini')
+
+    if not os.path.isdir('.assemble/manifests'):
+        if git_clone(config['manifest']['url'], config['manifest']['branch'], 0, '.assemble/manifests') != 0:
+            print('Failed to clone the manifest.')
+            exit(1)
+    else:
+        git_pull('.assemble/manifests')
+
+    if not os.path.isfile('.assemble/manifests/default.xml'):
+        print("The manifest repository doesn't contain default.xml.")
+        exit(1)
+
+    parse_manifest('.assemble/manifests/default.xml', parallel_count, depth)
+
+
+def main():
+    cli(prog_name="assemble")
+
+
+if __name__ == '__main__':
+    main()
