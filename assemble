@@ -71,8 +71,9 @@ def parse_manifest(path: str, parallel_count: int, depth: int):
             if child.attrib['remote'] in remotes.keys():
                 default_remote = child.attrib['remote']
         elif child.tag == 'project':
-            subprocess.call(
-                ['mkdir', '-p', os.path.dirname(child.attrib['path'])])
+            subprocess.run(
+                ['mkdir', '-p', os.path.dirname(child.attrib['path'])],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if 'remote' in child.attrib.keys():
                 _fetch = remotes[child.attrib['remote']]['fetch'].replace(
                             '{}', child.attrib['name'])
